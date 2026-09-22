@@ -730,10 +730,10 @@ export class UI {
     updateKartHUD(this);
     const g = this.g,
       p = g.player;
-    if (!p) return;
+    if (!p || !g.progress) return;
 
     // Performance: only update if changed
-    const cache = this._hudCache;
+    const cache = g._hudCache;
     
     const setIfChanged = (id, value, cacheKey) => {
       if (cache[cacheKey] !== value) {

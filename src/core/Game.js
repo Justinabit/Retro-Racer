@@ -805,12 +805,22 @@ export class Game {
       this.car.group.scale.setScalar(1);
       
       // Create multiplayer race manager - NO AI
-      this.multiplayerRace = new MultiplayerRace(this, this.lobby, this.lobbyPlayers);
-      await this.multiplayerRace.init();
-      
+      const race = new MultiplayerRace(this, this.lobby, this.lobbyPlayers);
+      this.multiplayerRace = race;
+      await race.init();
+
+      // If something else replaced this.multiplayerRace while we were
+      // awaiting init() (e.g. the lobby was left, or a newer race start
+      // began), this attempt is stale — discard it instead of clobbering
+      // whatever state is now current.
+      if (this.multiplayerRace !== race) {
+        race.dispose?.();
+        return;
+      }
+
       // Set local player references for compatibility with existing code
-      this.player = this.multiplayerRace.localPhysics;
-      this.progress = this.multiplayerRace.localProgress;
+      this.player = race.localPhysics;
+      this.progress = race.localProgress;
       this.car.group.position.copy(this.player.position);
       this.car.group.rotation.y = this.player.yaw;
       
