@@ -268,6 +268,13 @@ export class Game {
       });
 
       lobbyManager.on('raceStarting', (lobby) => {
+        // Defensive: ignore duplicate/late 'raceStarting' events if we're
+        // already mid-flow or racing, so a redelivered event can't reset
+        // world state out from under an active race.
+        if (["PLAYER_INTRO", "MAP_INTRO", "COUNTDOWN", "RACING"].includes(this.state)) {
+          console.log("[Game] Ignoring duplicate race starting event, already in", this.state);
+          return;
+        }
         console.log("[Game] Race starting");
         this.ui.toast("Race starting...");
         this.startMultiplayerRaceFlow();

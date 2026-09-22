@@ -519,8 +519,11 @@ export class LobbyManager {
         if (error) throw error;
 
         this.currentLobby = data;
-        this.emit('lobbyUpdated', data);
-        this.emit('raceStarting', data);
+        // Note: don't emit 'raceStarting' manually here — the host is also
+        // subscribed to this lobby's realtime channel (see subscribeToLobby),
+        // which will independently deliver this exact same status change.
+        // Emitting it here too caused the host to run the race-start flow
+        // twice, corrupting mid-race state.
 
         // After brief delay, set to racing
         setTimeout(async () => {
@@ -534,8 +537,8 @@ export class LobbyManager {
 
             if (racingData) {
               this.currentLobby = racingData;
-              this.emit('lobbyUpdated', racingData);
-              this.emit('raceStarted', racingData);
+              // Same reasoning: realtime subscription already emits
+              // 'raceStarted' for this update, don't double-emit here.
             }
           } catch (e) {
             console.error("[Lobby] Failed to set racing:", e);
