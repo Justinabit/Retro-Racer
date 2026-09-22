@@ -525,7 +525,10 @@ export class LobbyManager {
         // Emitting it here too caused the host to run the race-start flow
         // twice, corrupting mid-race state.
 
-        // After brief delay, set to racing
+        // After a brief delay, set to racing. This delay is the multiplayer
+        // "highlight screen" window shown to all clients (bounded to <=5s) —
+        // every client transitions off it in lockstep because they all react
+        // to this same realtime status change, not to their own local timer.
         setTimeout(async () => {
           try {
             const { data: racingData } = await supabase
@@ -543,7 +546,7 @@ export class LobbyManager {
           } catch (e) {
             console.error("[Lobby] Failed to set racing:", e);
           }
-        }, 3000);
+        }, 4200);
 
         return data;
       } else {
@@ -573,7 +576,7 @@ export class LobbyManager {
           this.currentLobby = this.mockLobbies[this.currentLobby.id];
           this.emit('lobbyUpdated', this.currentLobby);
           this.emit('raceStarted', this.currentLobby);
-        }, 3000);
+        }, 4200);
 
         return this.currentLobby;
       }

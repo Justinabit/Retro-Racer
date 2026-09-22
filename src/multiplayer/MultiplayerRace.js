@@ -2,7 +2,7 @@ import * as THREE from "three";
 import { Car } from "../player/Car.js";
 import { CarPhysics } from "../player/CarPhysics.js";
 import { RaceProgress, rankRacers } from "../track/Track.js";
-import { collisionSystem, separateVehicles } from "../physics/Collision.js";
+import { collisionSystem } from "../physics/Collision.js";
 import { getCurrentUserId } from "../supabase/auth.js";
 import { supabase, isSupabaseConfigured } from "../supabase/client.js";
 
@@ -423,60 +423,80 @@ export class MultiplayerRace {
   }
 
   checkMultiplayerCollisions(dt) {
-    const allVehicles = [
-      { 
-        position: this.localPhysics.position, 
-        velocity: this.localPhysics.velocity,
-        spec: this.localPhysics.spec,
-        id: this.localPlayerId,
-        physics: this.localPhysics,
-      },
-      ...Array.from(this.remotePlayers.values()).map(r => ({
-        position: r.position,
-        velocity: r.velocity,
-        spec: r.spec,
-        id: r.id,
-        physics: null, // Remote doesn't have physics, just visual
-      }))
-    ];
+    const local = {
+      position: this.localPhysics.position,
+      velocity: this.localPhysics.velocity,
+      spec: this.localPhysics.spec,
+      id: this.localPlayerId,
+    };
 
-    // Broad-phase + narrow-phase
-    for (let i = 0; i < allVehicles.length; i++) {
-      for (let j = i + 1; j < allVehicles.length; j++) {
-        const a = allVehicles[i];
-        const b = allVehicles[j];
-        
-        const dist = a.position.distanceTo(b.position);
-        if (dist < 2.2 && this.collisionCooldown <= 0) {
-          // Only resolve if one is local player (don't try to move remote arbitrarily)
-          if (a.id === this.localPlayerId || b.id === this.localPlayerId) {
-            const local = a.id === this.localPlayerId ? a : b;
-            const other = a.id === this.localPlayerId ? b : a;
-            
-            const normal = local.position.clone().sub(other.position);
-            normal.y = 0;
-            if (normal.lengthSq() < 0.001) normal.set(1, 0, 0);
-            normal.normalize();
-            
-            // Separate
-            local.position.addScaledVector(normal, 2.2 - dist + 0.05);
-            
-            // Velocity response with weight
-            const weightA = local.spec?.weight || 75;
-            const weightB = other.spec?.weight || 75;
-            
-            if (local.velocity) {
-              local.velocity.addScaledVector(normal, 7 * (weightB / weightA));
-              local.velocity.multiplyScalar(0.7 + weightA * 0.0019);
-            }
-            
-            if (local.physics) {
-              local.physics.collision = 1;
-            }
-            
-            this.game.audio.tone(65, 0.12, 0.18, "sawtooth");
-            this.collisionCooldown = 0.35;
+    // Local-vs-remote: use the same mass/restitution-aware resolver the
+    // rest of the game uses (collisionSystem), instead of a fixed magic
+    // push velocity. We only ever move/impulse OUR OWN car here — each
+    // remote player's position is authoritative on its own client and
+    // will simply overwrite anything we touch on its next network update
+    // (~50ms), so mutating it is a short-lived cosmetic nudge, not a
+    // source of desync.
+    if (this.collisionCooldown <= 0) {
+      for (const remote of this.remotePlayers.values()) {
+        const other = { position: remote.position, velocity: remote.velocity, spec: remote.spec, id: remote.id };
+        const collision = collisionSystem.checkVehicleCollision(local, other);
+        if (!collision.colliding) continue;
+
+        const normal = collision.normal.clone();
+        normal.y = 0;
+        if (normal.lengthSq() < 0.001) normal.set(1, 0, 0);
+        normal.normalize();
+
+        const massLocal = local.spec?.weight || 75;
+        const massOther = other.spec?.weight || 75;
+        const totalMass = massLocal + massOther;
+
+        // Positional correction, proportional to the other car's mass
+        local.position.addScaledVector(normal, collision.penetration * (massOther / totalMass) + 0.05);
+
+        // Velocity impulse along the collision normal, scaled by relative
+        // closing speed so a glancing touch is soft and a head-on hit is
+        // punishing - instead of always applying the same fixed bump.
+        const relVel = local.velocity.clone().sub(other.velocity || new THREE.Vector3());
+        const velAlongNormal = relVel.dot(normal);
+        if (velAlongNormal < 0) {
+          const restitution = 0.25;
+          const impulse = -(1 + restitution) * velAlongNormal * (massOther / totalMass);
+          local.velocity.addScaledVector(normal, impulse);
+          local.velocity.multiplyScalar(0.88);
+          // Give the other car's visual a matching kick for the instant
+          // before its own update overwrites it, so the hit reads as a
+          // two-sided bump rather than local bouncing off a static wall.
+          if (other.velocity) {
+            other.velocity.addScaledVector(normal, -impulse * (massLocal / massOther));
           }
+        }
+
+        this.localPhysics.collision = 1;
+        this.game.audio.tone(65, 0.12, 0.18, "sawtooth");
+        this.collisionCooldown = 0.35;
+        break; // resolve one hit per tick; the cooldown covers the rest
+      }
+    }
+
+    // Remote-vs-remote: purely cosmetic declutter so two other players'
+    // cars don't visibly clip through each other on THIS client's screen.
+    // Position-only, no velocity/audio - each remote's own client stays
+    // authoritative over its real position and will correct this on its
+    // next broadcast anyway.
+    const remoteList = Array.from(this.remotePlayers.values());
+    for (let i = 0; i < remoteList.length; i++) {
+      for (let j = i + 1; j < remoteList.length; j++) {
+        const a = remoteList[i], b = remoteList[j];
+        const dist = a.position.distanceTo(b.position);
+        if (dist < 2.2 && dist > 0.001) {
+          const normal = a.position.clone().sub(b.position);
+          normal.y = 0;
+          normal.normalize();
+          const push = (2.2 - dist) * 0.5;
+          a.position.addScaledVector(normal, push);
+          b.position.addScaledVector(normal, -push);
         }
       }
     }

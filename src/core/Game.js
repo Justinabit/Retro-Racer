@@ -85,9 +85,10 @@ export class Game {
     this.lobby = null;
     this.lobbyPlayers = [];
     this.isHost = false;
-    this.playerIntroIndex = 0;
-    this.mapIntroTime = 0;
-    
+    this.introStartTime = 0;
+    this.introDuration = 5;
+    this._startingMultiplayerRace = false;
+
     this.previewCar = CARS.find((c) => c.id === this.store.data.car) || CARS[0];
     this.previewTrack = TRACKS.find((t) => t.id === this.trackId) || TRACKS[0];
     if (this.previewCar.cost > this.store.data.finishes)
@@ -243,14 +244,25 @@ export class Game {
       lobbyManager.on('lobbyUpdated', (lobby) => {
         this.lobby = lobby;
         this.isHost = lobby.host_id === getCurrentUserId();
-        if (["MULTIPLAYER_LOBBY", "PLAYER_INTRO", "MAP_INTRO"].includes(this.state)) {
+        if (["MULTIPLAYER_LOBBY", "MULTIPLAYER_INTRO"].includes(this.state)) {
           this.ui.render();
+        }
+        // Fallback: if this client missed the 'raceStarted' realtime event
+        // (e.g. its tab was backgrounded/throttled), catch up here so it
+        // never gets stuck on the lobby/intro screen while everyone else
+        // is already racing.
+        if (
+          lobby.status === 'racing' &&
+          this.multiplayerActive &&
+          ["MULTIPLAYER_LOBBY", "MULTIPLAYER_INTRO"].includes(this.state)
+        ) {
+          this.startMultiplayerRace();
         }
       });
 
       lobbyManager.on('playersUpdated', (players) => {
         this.lobbyPlayers = players;
-        if (["MULTIPLAYER_LOBBY", "PLAYER_INTRO", "MAP_INTRO"].includes(this.state)) {
+        if (["MULTIPLAYER_LOBBY", "MULTIPLAYER_INTRO"].includes(this.state)) {
           this.ui.render();
         }
         // Update debug
@@ -271,19 +283,25 @@ export class Game {
         // Defensive: ignore duplicate/late 'raceStarting' events if we're
         // already mid-flow or racing, so a redelivered event can't reset
         // world state out from under an active race.
-        if (["PLAYER_INTRO", "MAP_INTRO", "COUNTDOWN", "RACING"].includes(this.state)) {
+        if (["MULTIPLAYER_INTRO", "COUNTDOWN", "RACING"].includes(this.state)) {
           console.log("[Game] Ignoring duplicate race starting event, already in", this.state);
           return;
         }
         console.log("[Game] Race starting");
         this.ui.toast("Race starting...");
-        this.startMultiplayerRaceFlow();
+        this.startMultiplayerIntroFlow();
       });
 
       lobbyManager.on('raceStarted', (lobby) => {
+        // This event is delivered to every subscribed client (host and
+        // guests alike) off the same realtime status change, so it is the
+        // single synced trigger that ends the highlight screen for
+        // everyone at (near enough) the same real-world moment — instead
+        // of each player deciding for themselves when to start, which is
+        // what let clients drift out of sync with each other.
         console.log("[Game] Race started (realtime)");
-        if (this.state === "MULTIPLAYER_LOBBY" || this.state === "PLAYER_INTRO" || this.state === "MAP_INTRO") {
-          // Already in flow, ignore
+        if (["MULTIPLAYER_LOBBY", "MULTIPLAYER_INTRO"].includes(this.state)) {
+          this.startMultiplayerRace();
         }
       });
 
@@ -744,42 +762,44 @@ export class Game {
       this.isHost = false;
       this.multiplayerActive = false;
       this.multiplayerRace = null;
+      this._startingMultiplayerRace = false;
       this.menu();
     }
   }
 
-  async startMultiplayerRaceFlow() {
-    // Flow: Lobby -> Loading -> Player Intro -> Map Intro -> Starting Grid -> Countdown -> Race
+  async startMultiplayerIntroFlow() {
+    // Flow: Lobby -> Loading -> Highlight screen (all players + map, host-
+    // agnostic, auto-advancing) -> Starting Grid -> Countdown -> Race.
+    // The highlight screen is purely a display: it does not decide when the
+    // race starts. That decision comes from the lobby's 'racing' status,
+    // which every client receives at the same time (see 'raceStarted').
     this.loading("PREPARING MULTIPLAYER RACE…", async () => {
       // Fetch latest players
       this.lobbyPlayers = await lobbyManager.fetchPlayers(this.lobby.id);
-      
+
       // Ensure no AI - multiplayer is human only
       console.log(`[Game] Starting multiplayer race with ${this.lobbyPlayers.length} human players, NO AI`);
-      
-      // Load track
+
+      // Load track - this happens once, in the background, while the
+      // highlight screen is showing, so every client is race-ready before
+      // the synced 'racing' trigger arrives.
       const trackData = TRACKS.find(t => t.id === this.lobby.map_id) || TRACKS[0];
       this.loadWorld(trackData);
       this.showWorld();
-      
-      // Start player introductions
-      this.playerIntroIndex = 0;
-      this.setState("PLAYER_INTRO");
+
+      this.introStartTime = this.time;
+      this.introDuration = 5; // hard cap, seconds
+      this.setState("MULTIPLAYER_INTRO");
     });
   }
 
-  nextPlayerIntro() {
-    this.playerIntroIndex++;
-    if (this.playerIntroIndex >= this.lobbyPlayers.length) {
-      // All players introduced, show map
-      this.setState("MAP_INTRO");
-      this.mapIntroTime = this.time + 3; // 3 seconds map intro
-    } else {
-      this.ui.render();
-    }
-  }
-
   async startMultiplayerRace() {
+    // Guard against double-invocation: this can be triggered by the synced
+    // 'raceStarted' realtime event, by the lobbyUpdated fallback, and by
+    // the local 5s highlight-screen safety timeout — only one should win.
+    if (this._startingMultiplayerRace || ["COUNTDOWN", "RACING"].includes(this.state)) return;
+    this._startingMultiplayerRace = true;
+
     this.loading("PREPARING THE GRID…", async () => {
       this.clearRace();
       this.multiplayerActive = true;
@@ -850,6 +870,7 @@ export class Game {
       this.lastGear = 1;
       
       this.setState("COUNTDOWN");
+      this._startingMultiplayerRace = false;
     });
   }
 
@@ -1286,7 +1307,7 @@ export class Game {
       cameraTarget.copy(loc.p).add(new THREE.Vector3(-90, 100, 70));
       lookTarget.copy(loc.p).add(new THREE.Vector3(35, -5, -20));
       this.camera.fov = 50;
-    } else if (["MULTIPLAYER_LOBBY", "PLAYER_INTRO", "MAP_INTRO"].includes(state)) {
+    } else if (["MULTIPLAYER_LOBBY", "MULTIPLAYER_INTRO"].includes(state)) {
       // Lobby camera - overview
       const loc = this.track.at(0.05);
       cameraTarget.copy(loc.p).add(new THREE.Vector3(-60, 80, 50));
@@ -1387,8 +1408,18 @@ export class Game {
         this.ui.updateHUD();
         this.hudClock = 0;
       }
-    } else if (this.state === "MAP_INTRO") {
-      if (this.time > this.mapIntroTime) {
+    } else if (this.state === "MULTIPLAYER_INTRO") {
+      const el = document.getElementById("mp-intro-progress");
+      if (el) {
+        const pct = Math.min(100, ((this.time - this.introStartTime) / this.introDuration) * 100);
+        el.style.width = pct + "%";
+      }
+      // Safety net only: the real trigger is the synced 'raceStarted'
+      // event (see lobbyManager.on('raceStarted', ...)). This just makes
+      // sure a client can never get stuck here forever if that event is
+      // somehow missed - it fires slightly after the server-side status
+      // flip so the event has every chance to win the race first.
+      if (this.time - this.introStartTime > this.introDuration + 1) {
         this.startMultiplayerRace();
       }
     }
