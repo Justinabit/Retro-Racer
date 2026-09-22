@@ -17,7 +17,8 @@ import { AICar } from "../ai/AICar.js";
 import { Particles } from "../effects/Particles.js";
 import { UI } from "../ui/UI.js";
 import { collisionSystem, separateVehicles } from "../physics/Collision.js";
-import { initAuth, getCurrentUserId, getProfile } from "../supabase/auth.js";
+import { initAuth, getCurrentUserId, getProfile, ensureProfile } from "../supabase/auth.js";
+import { isSupabaseConfigured } from "../supabase/client.js";
 import { lobbyManager } from "../multiplayer/Lobby.js";
 import { hasStoredUsername, getStoredUsername } from "../multiplayer/Username.js";
 import { MultiplayerRace } from "../multiplayer/MultiplayerRace.js";
@@ -289,6 +290,14 @@ export class Game {
       if (!hasStoredUsername()) {
         this.setState("USERNAME_PROMPT");
       } else {
+        if (isSupabaseConfigured()) {
+          try {
+            await ensureProfile(getStoredUsername());
+          } catch (e) {
+            console.warn("[Game] Failed to sync Supabase profile:", e);
+          }
+        }
+         this.menu();
         this.menu();
       }
     } catch (e) {
