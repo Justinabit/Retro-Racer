@@ -332,6 +332,11 @@ export class MultiplayerRace {
       }
     });
 
+    // Only subscribe now that every listener above is registered —
+    // Supabase requires .on() calls to happen before .subscribe(),
+    // otherwise they're silently ignored.
+    lobbyManager.subscribeBroadcastChannel();
+
     console.log("[MultiplayerRace] Broadcast channel setup");
   }
 

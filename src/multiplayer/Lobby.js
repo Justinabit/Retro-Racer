@@ -748,6 +748,11 @@ export class LobbyManager {
   }
 
   // For broadcast channel (position sync)
+  // Note: this creates the channel but does NOT subscribe it yet.
+  // Supabase realtime requires all `.on(...)` listeners to be registered
+  // BEFORE `.subscribe()` is called, or they silently never fire. The
+  // caller (MultiplayerRace.setupBroadcast) registers its listeners and
+  // then calls subscribeBroadcastChannel() itself once ready.
   getBroadcastChannel() {
     if (!this.currentLobby) return null;
     
@@ -760,7 +765,7 @@ export class LobbyManager {
             broadcast: { self: false },
           },
         });
-        this.broadcastChannel.subscribe();
+        this._broadcastChannelSubscribed = false;
       } else {
         // Mock broadcast using localStorage events
         this.broadcastChannel = {
@@ -793,10 +798,22 @@ export class LobbyManager {
           subscribe: () => this.broadcastChannel,
           unsubscribe: () => {},
         };
+        this._broadcastChannelSubscribed = true; // mock has nothing to subscribe
       }
     }
     
     return this.broadcastChannel;
+  }
+
+  // Subscribes the broadcast channel. Safe to call multiple times — only
+  // actually subscribes once. Call this AFTER all `.on(...)` listeners
+  // have been registered on the channel returned by getBroadcastChannel().
+  subscribeBroadcastChannel() {
+    if (!this.broadcastChannel || this._broadcastChannelSubscribed) return;
+    this._broadcastChannelSubscribed = true;
+    this.broadcastChannel.subscribe((status) => {
+      console.log("[Lobby] Broadcast channel status:", status);
+    });
   }
 }
 
