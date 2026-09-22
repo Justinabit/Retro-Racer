@@ -290,6 +290,10 @@ export class Game {
       if (!hasStoredUsername()) {
         this.setState("USERNAME_PROMPT");
       } else {
+        // A username exists locally, but the Supabase "profiles" row may not
+        // (e.g. it was saved before Supabase was connected, or on another
+        // device). Sync it now so hosting/joining a lobby never fails on the
+        // profiles foreign key.
         if (isSupabaseConfigured()) {
           try {
             await ensureProfile(getStoredUsername());
@@ -297,7 +301,6 @@ export class Game {
             console.warn("[Game] Failed to sync Supabase profile:", e);
           }
         }
-         this.menu();
         this.menu();
       }
     } catch (e) {
@@ -345,7 +348,7 @@ export class Game {
     this.resize();
   }
 
-  async loading(text, action) {
+  async loading(text, action, opts = {}) {
     const token = ++this.loadToken;
     this.loadingText = text;
     this.setState("LOADING");
@@ -355,7 +358,11 @@ export class Game {
       await action();
     } catch (e) {
       console.error(e);
-      this.showError("The track could not be prepared. Reload to try again.");
+      if (opts.onError) {
+        opts.onError(e);
+      } else {
+        this.showError("The track could not be prepared. Reload to try again.");
+      }
     }
   }
 
@@ -657,65 +664,65 @@ export class Game {
   }
 
   async createMultiplayerLobby() {
-    try {
-      this.loading("CREATING LOBBY…", async () => {
-        const mode = this.store.data.mode || 'classic';
-        const mapId = this.trackId || 'coast';
-        const car = this.store.data.car || 'gt';
-        const character = this.store.data.character || 'vex';
-        
-        const { lobby, player } = await lobbyManager.createLobby({
-          mode,
-          mapId,
-          car,
-          character,
-        });
-        
-        this.lobby = lobby;
-        this.lobbyPlayers = [player];
-        this.isHost = true;
-        this.multiplayerActive = true;
-        
-        // Load world for selected map
-        const trackData = TRACKS.find(t => t.id === mapId) || TRACKS[0];
-        this.loadWorld(trackData);
-        this.showWorld();
-        if (this.car) this.car.group.visible = false;
-        
-        this.setState("MULTIPLAYER_LOBBY");
+    await this.loading("CREATING LOBBY…", async () => {
+      const mode = this.store.data.mode || 'classic';
+      const mapId = this.trackId || 'coast';
+      const car = this.store.data.car || 'gt';
+      const character = this.store.data.character || 'vex';
+      
+      const { lobby, player } = await lobbyManager.createLobby({
+        mode,
+        mapId,
+        car,
+        character,
       });
-    } catch (e) {
-      console.error("[Game] Create lobby failed:", e);
-      this.ui.toast(e.message || "Failed to create lobby");
-      this.setState("MULTIPLAYER_MENU");
-    }
+      
+      this.lobby = lobby;
+      this.lobbyPlayers = [player];
+      this.isHost = true;
+      this.multiplayerActive = true;
+      
+      // Load world for selected map
+      const trackData = TRACKS.find(t => t.id === mapId) || TRACKS[0];
+      this.loadWorld(trackData);
+      this.showWorld();
+      if (this.car) this.car.group.visible = false;
+      
+      this.setState("MULTIPLAYER_LOBBY");
+    }, {
+      onError: (e) => {
+        console.error("[Game] Create lobby failed:", e);
+        this.ui.toast(e.message || "Failed to create lobby");
+        this.setState("MULTIPLAYER_MENU");
+      }
+    });
   }
 
   async joinMultiplayerLobby(code) {
-    try {
-      this.loading("JOINING LOBBY…", async () => {
-        const { lobby, player } = await lobbyManager.joinLobby(code);
-        
-        this.lobby = lobby;
-        this.isHost = lobby.host_id === getCurrentUserId();
-        this.multiplayerActive = true;
-        
-        // Load world for lobby's map
-        const trackData = TRACKS.find(t => t.id === lobby.map_id) || TRACKS[0];
-        this.loadWorld(trackData);
-        this.showWorld();
-        if (this.car) this.car.group.visible = false;
-        
-        // Fetch players
-        this.lobbyPlayers = await lobbyManager.fetchPlayers(lobby.id);
-        
-        this.setState("MULTIPLAYER_LOBBY");
-      });
-    } catch (e) {
-      console.error("[Game] Join lobby failed:", e);
-      this.ui.toast(e.message || "Failed to join lobby");
-      throw e;
-    }
+    await this.loading("JOINING LOBBY…", async () => {
+      const { lobby, player } = await lobbyManager.joinLobby(code);
+      
+      this.lobby = lobby;
+      this.isHost = lobby.host_id === getCurrentUserId();
+      this.multiplayerActive = true;
+      
+      // Load world for lobby's map
+      const trackData = TRACKS.find(t => t.id === lobby.map_id) || TRACKS[0];
+      this.loadWorld(trackData);
+      this.showWorld();
+      if (this.car) this.car.group.visible = false;
+      
+      // Fetch players
+      this.lobbyPlayers = await lobbyManager.fetchPlayers(lobby.id);
+      
+      this.setState("MULTIPLAYER_LOBBY");
+    }, {
+      onError: (e) => {
+        console.error("[Game] Join lobby failed:", e);
+        this.ui.toast(e.message || "Failed to join lobby");
+        this.setState("MULTIPLAYER_MENU");
+      }
+    });
   }
 
   async leaveMultiplayer() {
