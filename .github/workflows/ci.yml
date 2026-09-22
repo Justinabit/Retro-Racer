@@ -1,0 +1,36 @@
+name: Racing checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Browser integration
+        run: |
+          npm run dev -- --port 5173 > /tmp/pixel-racer-vite.log 2>&1 &
+          node --input-type=module -e 'for (let i=0; i<30; i++) { try { if ((await fetch("http://localhost:5173")).ok) process.exit(0); } catch {} await new Promise(r=>setTimeout(r,1000)); } process.exit(1);'
+          npm run test:browser
+          npm run test:kart-browser
+      - name: Browser report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-report
+          path: |
+            .cache/browser-tests/*.json
+            .cache/browser-tests/*.png
+            .cache/kart-browser/*.json
+            .cache/kart-browser/*.png
+          if-no-files-found: ignore
