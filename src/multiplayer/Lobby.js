@@ -1,6 +1,6 @@
 import { supabase, isSupabaseConfigured } from "../supabase/client.js";
 import { getCurrentUserId, getProfile } from "../supabase/auth.js";
-import { validateUsername } from "./Username.js";
+import { serverClock } from "./Clock.js";
 
 // Generate random 6-digit code
 export function generateLobbyCode() {
@@ -25,8 +25,6 @@ export class LobbyManager {
     this.isHost = false;
     this.lobbyChannel = null;
     this.playersChannel = null;
-    this.broadcastChannel = null;
-    this.presenceChannel = null;
     this.listeners = new Map();
     this.mockLobbies = this.loadMockLobbies();
   }
@@ -199,6 +197,7 @@ export class LobbyManager {
         this.currentLobby = lobby;
         this.currentPlayers = existing;
         this.isHost = true;
+        await this.subscribeToLobby(lobbyId);
 
         console.log("[Lobby] Created (mock):", lobby.code, lobby.id);
         this.emit('lobbyCreated', { lobby, player });
@@ -290,6 +289,7 @@ export class LobbyManager {
         return { lobby, player };
       } else {
         // Mock mode
+        this.mockLobbies = this.loadMockLobbies();
         const lobby = Object.values(this.mockLobbies).find(
           l => l.code === validation.code && l.status === 'waiting'
         );
@@ -333,6 +333,7 @@ export class LobbyManager {
         this.currentLobby = lobby;
         this.currentPlayers = existingPlayers;
         this.isHost = lobby.host_id === userId;
+        await this.subscribeToLobby(lobby.id);
 
         console.log("[Lobby] Joined (mock):", lobby.code);
         this.emit('lobbyJoined', { lobby, player });
@@ -406,6 +407,8 @@ export class LobbyManager {
     const userId = getCurrentUserId();
     const updates = {};
 
+    if (this.currentLobby.status !== 'waiting') throw new Error('Race roster is locked');
+    if (car !== undefined || character !== undefined) updates.is_ready = false;
     if (car !== undefined) updates.selected_car = car;
     if (character !== undefined) updates.selected_character = character;
     if (isReady !== undefined) updates.is_ready = isReady;
@@ -494,61 +497,12 @@ export class LobbyManager {
 
     try {
       if (isSupabaseConfigured()) {
-        // Validate via RPC
-        const { data: canStart, error: validateError } = await supabase
-          .rpc('can_start_race', {
-            lobby_uuid: this.currentLobby.id,
-            requester_id: userId,
-          });
-
-        if (validateError) throw validateError;
-
-        if (!canStart) {
-          throw new Error("Cannot start race: not all players ready, invalid selections, or not enough players");
-        }
-
-        // Update lobby status to starting
-        const { data, error } = await supabase
-          .from("lobbies")
-          .update({ status: 'starting', updated_at: new Date().toISOString() })
-          .eq("id", this.currentLobby.id)
-          .eq("host_id", userId)
-          .select()
-          .single();
-
+        await serverClock.sync();
+        const { data, error } = await supabase.rpc('start_race', { lobby_uuid: this.currentLobby.id });
         if (error) throw error;
-
-        this.currentLobby = data;
-        // Note: don't emit 'raceStarting' manually here — the host is also
-        // subscribed to this lobby's realtime channel (see subscribeToLobby),
-        // which will independently deliver this exact same status change.
-        // Emitting it here too caused the host to run the race-start flow
-        // twice, corrupting mid-race state.
-
-        // After a brief delay, set to racing. This delay is the multiplayer
-        // "highlight screen" window shown to all clients (bounded to <=5s) —
-        // every client transitions off it in lockstep because they all react
-        // to this same realtime status change, not to their own local timer.
-        setTimeout(async () => {
-          try {
-            const { data: racingData } = await supabase
-              .from("lobbies")
-              .update({ status: 'racing', updated_at: new Date().toISOString() })
-              .eq("id", this.currentLobby.id)
-              .select()
-              .single();
-
-            if (racingData) {
-              this.currentLobby = racingData;
-              // Same reasoning: realtime subscription already emits
-              // 'raceStarted' for this update, don't double-emit here.
-            }
-          } catch (e) {
-            console.error("[Lobby] Failed to set racing:", e);
-          }
-        }, 4200);
-
-        return data;
+        const lobby = Array.isArray(data) ? data[0] : data;
+        this.applyLobby(lobby);
+        return lobby;
       } else {
         // Mock validation
         const mockPlayersKey = `mock-lobby-players-${this.currentLobby.id}`;
@@ -562,22 +516,11 @@ export class LobbyManager {
           throw new Error("Invalid character selections");
         }
 
-        this.mockLobbies[this.currentLobby.id].status = 'starting';
-        this.mockLobbies[this.currentLobby.id].updated_at = new Date().toISOString();
+        this.mockLobbies[this.currentLobby.id] = { ...this.currentLobby, status: 'starting',
+          race_id: crypto.randomUUID(), race_start_at: new Date(serverClock.now() + 10000).toISOString(),
+          updated_at: new Date().toISOString() };
         this.saveMockLobbies();
-        this.currentLobby = this.mockLobbies[this.currentLobby.id];
-        this.emit('lobbyUpdated', this.currentLobby);
-        this.emit('raceStarting', this.currentLobby);
-
-        setTimeout(() => {
-          this.mockLobbies[this.currentLobby.id].status = 'racing';
-          this.mockLobbies[this.currentLobby.id].updated_at = new Date().toISOString();
-          this.saveMockLobbies();
-          this.currentLobby = this.mockLobbies[this.currentLobby.id];
-          this.emit('lobbyUpdated', this.currentLobby);
-          this.emit('raceStarted', this.currentLobby);
-        }, 4200);
-
+        this.applyLobby(this.mockLobbies[this.currentLobby.id]);
         return this.currentLobby;
       }
     } catch (e) {
@@ -586,7 +529,36 @@ export class LobbyManager {
     }
   }
 
+  applyLobby(lobby) {
+    if (!lobby?.id || lobby.id !== this.currentLobby?.id) return;
+    if (Date.parse(lobby.updated_at) < Date.parse(this.currentLobby.updated_at)) return;
+    if (JSON.stringify(lobby) === JSON.stringify(this.currentLobby) && (lobby.status !== 'starting' || this.startEmitted === lobby.race_id)) return;
+    this.currentLobby = lobby;
+    this.isHost = lobby.host_id === getCurrentUserId();
+    this.emit('lobbyUpdated', lobby);
+    if (lobby.status === 'starting' && this.startEmitted !== lobby.race_id) {
+      this.startEmitted = lobby.race_id;
+      this.emit('raceStarting', lobby);
+    }
+    if (lobby.status === 'racing') this.emit('raceStarted', lobby);
+    if (lobby.status === 'closed') this.emit('lobbyClosed', lobby);
+  }
+
+  async refreshLobby(lobbyId) {
+    if (this.refreshBusy || this.currentLobby?.id !== lobbyId) return;
+    this.refreshBusy = true;
+    try {
+      const { data } = await supabase.from('lobbies').select('*').eq('id', lobbyId).single();
+      if (this.currentLobby?.id === lobbyId && data) this.applyLobby(data);
+    } catch (error) { console.warn("[Lobby] Refresh deferred:", error.message); }
+    finally { this.refreshBusy = false; }
+  }
+
   async subscribeToLobby(lobbyId) {
+    const generation = this.subscriptionGeneration = (this.subscriptionGeneration || 0) + 1;
+    await this.unsubscribeFromLobby(false);
+    if (generation !== this.subscriptionGeneration || this.currentLobby?.id !== lobbyId) return;
+    this.subscribedLobbyId = lobbyId;
     if (isSupabaseConfigured()) {
       // Subscribe to lobby changes
       this.lobbyChannel = supabase
@@ -597,22 +569,13 @@ export class LobbyManager {
           table: 'lobbies',
           filter: `id=eq.${lobbyId}`
         }, (payload) => {
-          console.log("[Lobby] Realtime lobby update:", payload);
-          if (payload.new) {
-            this.currentLobby = payload.new;
-            this.isHost = payload.new.host_id === getCurrentUserId();
-            this.emit('lobbyUpdated', payload.new);
-            
-            if (payload.new.status === 'starting') {
-              this.emit('raceStarting', payload.new);
-            } else if (payload.new.status === 'racing') {
-              this.emit('raceStarted', payload.new);
-            } else if (payload.new.status === 'closed') {
-              this.emit('lobbyClosed', payload.new);
-            }
-          }
+          if (generation === this.subscriptionGeneration) this.applyLobby(payload.new);
         })
-        .subscribe();
+        .subscribe(status => {
+          if (status === 'SUBSCRIBED') void this.refreshLobby(lobbyId);
+        });
+      // Low-frequency durable-state recovery only. Never movement polling.
+      this.refreshTimer = setInterval(() => void this.refreshLobby(lobbyId), 5000);
 
       // Subscribe to players
       this.playersChannel = supabase
@@ -625,7 +588,9 @@ export class LobbyManager {
         }, async (payload) => {
           console.log("[Lobby] Realtime players update:", payload);
           // Fetch all players
+          const version = this.playersFetchVersion = (this.playersFetchVersion || 0) + 1;
           const players = await this.fetchPlayers(lobbyId);
+          if (generation !== this.subscriptionGeneration || version !== this.playersFetchVersion || this.currentLobby?.id !== lobbyId) return;
           this.currentPlayers = players;
           this.emit('playersUpdated', players);
           
@@ -641,6 +606,7 @@ export class LobbyManager {
 
       // Initial fetch
       const players = await this.fetchPlayers(lobbyId);
+      if (generation !== this.subscriptionGeneration) return;
       this.currentPlayers = players;
       this.emit('playersUpdated', players);
     } else {
@@ -649,7 +615,8 @@ export class LobbyManager {
         const mockPlayersKey = `mock-lobby-players-${lobbyId}`;
         const players = JSON.parse(localStorage.getItem(mockPlayersKey) || "[]");
         
-        // Check if lobby still exists
+        // Re-read shared storage so tabs see status/selection changes.
+        this.mockLobbies = this.loadMockLobbies();
         const lobby = this.mockLobbies[lobbyId];
         if (!lobby) {
           this.emit('lobbyClosed', {});
@@ -657,25 +624,11 @@ export class LobbyManager {
           return;
         }
 
-        // Check for changes
-        const currentIds = new Set(this.currentPlayers.map(p => p.id));
-        const newIds = new Set(players.map(p => p.id));
-        
-        if (currentIds.size !== newIds.size || 
-            JSON.stringify(players.map(p => p.is_ready).sort()) !== 
-            JSON.stringify(this.currentPlayers.map(p => p.is_ready).sort())) {
+        if (JSON.stringify(players) !== JSON.stringify(this.currentPlayers)) {
           this.currentPlayers = players;
           this.emit('playersUpdated', players);
         }
-
-        // Check lobby status changes
-        if (lobby.status !== this.currentLobby?.status) {
-          this.currentLobby = lobby;
-          this.emit('lobbyUpdated', lobby);
-          if (lobby.status === 'starting') this.emit('raceStarting', lobby);
-          if (lobby.status === 'racing') this.emit('raceStarted', lobby);
-          if (lobby.status === 'closed') this.emit('lobbyClosed', lobby);
-        }
+        this.applyLobby(lobby);
       }, 1000);
     }
   }
@@ -703,39 +656,20 @@ export class LobbyManager {
       }
     } catch (e) {
       console.error("[Lobby] Fetch players failed:", e);
-      return [];
+      return this.currentLobby?.id === lobbyId ? this.currentPlayers : [];
     }
   }
 
-  async unsubscribeFromLobby() {
-    if (this.lobbyChannel) {
-      try {
-        await supabase.removeChannel(this.lobbyChannel);
-      } catch {}
-      this.lobbyChannel = null;
-    }
-    if (this.playersChannel) {
-      try {
-        await supabase.removeChannel(this.playersChannel);
-      } catch {}
-      this.playersChannel = null;
-    }
-    if (this.broadcastChannel) {
-      try {
-        await supabase.removeChannel(this.broadcastChannel);
-      } catch {}
-      this.broadcastChannel = null;
-    }
-    if (this.presenceChannel) {
-      try {
-        await supabase.removeChannel(this.presenceChannel);
-      } catch {}
-      this.presenceChannel = null;
-    }
-    if (this.mockPollInterval) {
-      clearInterval(this.mockPollInterval);
-      this.mockPollInterval = null;
-    }
+  async unsubscribeFromLobby(invalidate = true) {
+    if (invalidate) this.subscriptionGeneration = (this.subscriptionGeneration || 0) + 1;
+    this.playersFetchVersion = (this.playersFetchVersion || 0) + 1;
+    this.subscribedLobbyId = null;
+    this.startEmitted = null;
+    clearInterval(this.refreshTimer); this.refreshTimer = null;
+    clearInterval(this.mockPollInterval); this.mockPollInterval = null;
+    const channels = [this.lobbyChannel, this.playersChannel].filter(Boolean);
+    this.lobbyChannel = null; this.playersChannel = null;
+    await Promise.allSettled(channels.map(channel => supabase.removeChannel(channel)));
   }
 
   getLobby() {
@@ -750,75 +684,6 @@ export class LobbyManager {
     return this.isHost;
   }
 
-  // For broadcast channel (position sync)
-  // Note: this creates the channel but does NOT subscribe it yet.
-  // Supabase realtime requires all `.on(...)` listeners to be registered
-  // BEFORE `.subscribe()` is called, or they silently never fire. The
-  // caller (MultiplayerRace.setupBroadcast) registers its listeners and
-  // then calls subscribeBroadcastChannel() itself once ready.
-  getBroadcastChannel() {
-    if (!this.currentLobby) return null;
-    
-    const channelName = `race-${this.currentLobby.id}`;
-    
-    if (!this.broadcastChannel) {
-      if (isSupabaseConfigured()) {
-        this.broadcastChannel = supabase.channel(channelName, {
-          config: {
-            broadcast: { self: false },
-          },
-        });
-        this._broadcastChannelSubscribed = false;
-      } else {
-        // Mock broadcast using localStorage events
-        this.broadcastChannel = {
-          name: channelName,
-          send: async ({ type, event, payload }) => {
-            const key = `broadcast-${channelName}-${event}`;
-            localStorage.setItem(key, JSON.stringify({ payload, timestamp: Date.now() }));
-            // Dispatch storage event for same-tab testing
-            window.dispatchEvent(new StorageEvent('storage', {
-              key,
-              newValue: JSON.stringify({ payload, timestamp: Date.now() }),
-            }));
-          },
-          on: (type, filter, cb) => {
-            if (type === 'broadcast') {
-              const eventName = filter.event;
-              const handler = (e) => {
-                if (e.key && e.key.startsWith(`broadcast-${channelName}-${eventName}`)) {
-                  try {
-                    const data = JSON.parse(e.newValue);
-                    cb({ payload: data.payload });
-                  } catch {}
-                }
-              };
-              window.addEventListener('storage', handler);
-              return this.broadcastChannel;
-            }
-            return this.broadcastChannel;
-          },
-          subscribe: () => this.broadcastChannel,
-          unsubscribe: () => {},
-        };
-        this._broadcastChannelSubscribed = true; // mock has nothing to subscribe
-      }
-    }
-    
-    return this.broadcastChannel;
-  }
-
-  // Subscribes the broadcast channel. Safe to call multiple times — only
-  // actually subscribes once. Call this AFTER all `.on(...)` listeners
-  // have been registered on the channel returned by getBroadcastChannel().
-  subscribeBroadcastChannel() {
-    if (!this.broadcastChannel || this._broadcastChannelSubscribed) return;
-    this._broadcastChannelSubscribed = true;
-    this.broadcastChannel.subscribe((status) => {
-      console.log("[Lobby] Broadcast channel status:", status);
-    });
-  }
 }
 
-// Singleton
 export const lobbyManager = new LobbyManager();

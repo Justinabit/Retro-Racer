@@ -36,6 +36,7 @@ function observe(p) {
 }
 observe(page);
 await page.addInitScript(() => {
+  localStorage.setItem("pixel-racer-username", "TestDriver");
   if (!localStorage.getItem("pixel-racer-save"))
     localStorage.setItem(
       "pixel-racer-save",

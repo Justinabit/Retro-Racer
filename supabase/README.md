@@ -2,6 +2,24 @@
 
 This directory contains all the database schema and setup required for the multiplayer functionality.
 
+## Networking upgrade (existing installations)
+
+Apply **`migrations/005_race_network.sql`** before deploying the updated client.
+It creates the frozen race roster, shared server deadline/RPCs, private Realtime
+sender authorization, and idempotent ranked finishes. The same SQL is included
+at the end of `schema.sql` for new installations. No movement is persisted.
+
+Private Broadcast/Presence requires the `realtime.messages` RLS policies in 005.
+Audit existing policies: permissive “allow all authenticated” policies must not
+grant access to `race:` topics, because permissive policies combine with OR.
+Use distinct authenticated users when testing. A browser's normal tabs usually
+share the same persisted Supabase login; use separate profiles/incognito/devices.
+
+See [the networking audit, limits, and live acceptance checklist](../docs/MULTIPLAYER.md).
+Eight-racer message fan-out needs an appropriately sized Realtime quota; do not
+assume a free project's throughput is sufficient or raise the send rate to hide
+throttling. Never use a service-role key in the frontend.
+
 ## Quick Start
 
 ### 1. Create Supabase Project
@@ -54,6 +72,7 @@ This directory contains all the database schema and setup required for the multi
    -- 2. supabase/migrations/002_functions_and_triggers.sql
    -- 3. supabase/migrations/003_rls_policies.sql
    -- 4. supabase/migrations/004_realtime.sql
+   -- 5. supabase/migrations/005_race_network.sql
    ```
 
 ### 6. Enable Realtime
@@ -70,7 +89,7 @@ This directory contains all the database schema and setup required for the multi
    Or run the SQL in `004_realtime.sql` which attempts to add them automatically.
 
 4. For Broadcast and Presence (used for position sync):
-   - No additional setup needed - these are ephemeral channels
+   - Apply 005 to authorize the private `race:<raceId>:<playerId>` topics
    - The game uses Broadcast for vehicle positions (not stored in DB)
    - Presence is used for online status
 
@@ -101,12 +120,18 @@ Open http://localhost:5173
 - **lobbies**: Multiplayer lobbies (6-digit code, host, mode, map, status)
 - **lobby_players**: Players in lobbies (car, character, ready state)
 - **race_sessions**: Race instances for a lobby
+- **race_members**: Frozen authenticated grid and selections, private-channel authorization
 - **race_results**: Finish positions for real players only
 
 ### Functions
 
 - `generate_lobby_code()`: Generates unique 6-digit numeric code
 - `can_start_race(lobby_id, user_id)`: Validates host can start (ready, min 2, max 8, valid selections)
+- `start_race(lobby_uuid)`: Atomic host/ready validation, frozen roster, server-timed start
+- `race_server_time()`: Clock-offset estimation
+- `mark_race_started(rid)`: Acknowledge GO only after the server deadline
+- `submit_race_finish(rid, seconds)`: Idempotent own finish and serialized ranking
+- `race_topic_allowed(topic, writing)`: Topic owner/membership authorization
 - `handle_host_migration()`: When host leaves, earliest joined becomes new host
 - `cleanup_old_lobbies()`: Closes old waiting lobbies, deletes old closed ones
 

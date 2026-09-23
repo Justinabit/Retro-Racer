@@ -135,7 +135,7 @@ All items use 0.5 s roulette, 1.4 s cooldown, 5 s box respawn, 12 s token respaw
 
 ### Deliberate scope
 
-This is a single-player arcade game. **LOCAL RECORDS are device-local, not an online leaderboard.** Weather is authored into each track (sunset, clear day, night, or fog); there is no selectable rain mode. Models, effects, audio and textures are generated procedurally—no unavailable licensed car assets, fake multiplayer buttons, or nonfunctional purchase options are included. It uses stylized standard lighting, not ray-traced reflections or a general-purpose rigid-body physics engine.
+The original single-player modes are preserved alongside multiplayer. **LOCAL RECORDS are device-local, not an online leaderboard.** Weather is authored into each track (sunset, clear day, night, or fog); there is no selectable rain mode. Models, effects, audio and textures are generated procedurally—no unavailable licensed car assets, fake multiplayer buttons, or nonfunctional purchase options are included. It uses stylized standard lighting, not ray-traced reflections or a general-purpose rigid-body physics engine.
 
 ## Save data
 
@@ -147,7 +147,9 @@ To reset your own progress, delete that key in browser developer tools. No perso
 
 ## Multiplayer (Real-Player Only)
 
-**New:** Online multiplayer for 2-8 human players, zero AI. Requires Supabase (free tier) or works in offline mock mode (same-browser testing).
+**Networking update:** Apply `supabase/migrations/005_race_network.sql` to existing projects before deploying this client. See [the audit, tests, measured limits and live acceptance checklist](docs/MULTIPLAYER.md). Live Supabase/WAN and eight-device competitive performance still need verification.
+
+**New:** Online multiplayer for 2-8 human players, zero AI. Requires a Supabase project with sufficient Realtime throughput, or works in offline mock mode (same-browser testing).
 
 ### Quick Start Multiplayer
 

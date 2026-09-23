@@ -13,11 +13,6 @@ if (supabaseUrl && supabaseAnonKey) {
         persistSession: true,
         autoRefreshToken: true,
       },
-      realtime: {
-        params: {
-          eventsPerSecond: 20,
-        },
-      },
     });
     isConfigured = true;
     console.log("[Supabase] Client initialized");
