@@ -96,6 +96,7 @@ export class ItemSystem {
     );
   }
   hit(r, kind, owner) {
+    if (r.remote) return false; // Only the victim client may change its own physics.
     if (r.progress.finished || r.immune > 0 || r.locked > 0) return false;
     if (r.shield > 0) {
       r.shield = 0;
@@ -142,7 +143,7 @@ export class ItemSystem {
       wave.color = color;
     }
   }
-  activate(r) {
+  activate(r, targetId) {
     if (
       !r ||
       !r.item ||
@@ -165,6 +166,7 @@ export class ItemSystem {
             distance(r, o) < 160,
         )
         .sort((a, b) => a.progress.total - b.progress.total)[0];
+      if (r.remote && targetId !== undefined) target = this.racers.find(o => o.id === targetId);
       if (!target) {
         this.notify("no-target", r);
         return false;
@@ -174,6 +176,7 @@ export class ItemSystem {
       p.life = 4;
       p.owner = r.id;
       p.target = target.id;
+      r.lastTarget = target.networkId || this.localPlayerId;
       p.position.copy(r.position).add(new THREE.Vector3(0, 1, 0));
       p.velocity
         .copy(target.position)
@@ -236,7 +239,7 @@ export class ItemSystem {
       };
       if (r.item) r.held += dt;
       if (
-        r.id > 0 &&
+        !r.remote && r.id > 0 &&
         r.held >
           (r.personality === "aggressive"
             ? 0.7
@@ -274,7 +277,7 @@ export class ItemSystem {
       box.cooldown = Math.max(0, box.cooldown - dt);
       if (box.cooldown > 0) continue;
       for (const r of this.racers) {
-        if (r.item || r.progress.finished || r.locked > 0) continue;
+        if (r.remote || r.item || r.progress.finished || r.locked > 0) continue;
         if (r.position.distanceTo(box.position) < (r.magnet > 0 ? 12 : 3.8)) {
           r.item = rollItem(this.rank(r), this.random);
           r.roulette = 0.5;
@@ -282,7 +285,7 @@ export class ItemSystem {
           r.pickups++;
           box.cooldown = 5;
           this.burst(box.position, 0xe2c7ff, 3);
-          this.notify("pickup", r);
+          this.notify("pickup", r, this.boxes.indexOf(box));
           break;
         }
       }
@@ -292,7 +295,7 @@ export class ItemSystem {
       if (token.cooldown > 0) continue;
       for (const r of this.racers)
         if (
-          !r.progress.finished &&
+          !r.remote && !r.progress.finished &&
           r.locked <= 0 &&
           r.position.distanceTo(token.position) < (r.magnet > 0 ? 12 : 2.8)
         ) {

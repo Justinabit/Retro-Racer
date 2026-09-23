@@ -18,9 +18,11 @@ import { Particles } from "../effects/Particles.js";
 import { UI } from "../ui/UI.js";
 import { collisionSystem, separateVehicles } from "../physics/Collision.js";
 import { initAuth, getCurrentUserId, getProfile, ensureProfile } from "../supabase/auth.js";
-import { isSupabaseConfigured } from "../supabase/client.js";
+import { supabase, isSupabaseConfigured } from "../supabase/client.js";
 import { lobbyManager } from "../multiplayer/Lobby.js";
 import { hasStoredUsername, getStoredUsername } from "../multiplayer/Username.js";
+import { serverClock } from "../multiplayer/Clock.js";
+import { CarPreview } from "../multiplayer/CarPreview.js";
 import { MultiplayerRace } from "../multiplayer/MultiplayerRace.js";
 
 export class Game {
@@ -244,6 +246,7 @@ export class Game {
       lobbyManager.on('lobbyUpdated', (lobby) => {
         this.lobby = lobby;
         this.isHost = lobby.host_id === getCurrentUserId();
+        if (this.multiplayerActive) this.store.data.mode = lobby.mode;
         if (["MULTIPLAYER_LOBBY", "MULTIPLAYER_INTRO"].includes(this.state)) {
           this.ui.render();
         }
@@ -703,7 +706,7 @@ export class Game {
       });
       
       this.lobby = lobby;
-      this.lobbyPlayers = [player];
+      this.lobbyPlayers = lobbyManager.getPlayers();
       this.isHost = true;
       this.multiplayerActive = true;
       
@@ -737,6 +740,9 @@ export class Game {
       this.showWorld();
       if (this.car) this.car.group.visible = false;
       
+      this.store.data.car = player.selected_car;
+      this.store.data.character = player.selected_character || 'vex';
+      this.store.data.mode = lobby.mode;
       // Fetch players
       this.lobbyPlayers = await lobbyManager.fetchPlayers(lobby.id);
       
@@ -751,6 +757,8 @@ export class Game {
   }
 
   async leaveMultiplayer() {
+    ++this.loadToken;
+    this.multiplayerRace?.dispose();
     try {
       await lobbyManager.leaveLobby();
     } catch (e) {
@@ -768,14 +776,14 @@ export class Game {
   }
 
   async startMultiplayerIntroFlow() {
-    // Flow: Lobby -> Loading -> Highlight screen (all players + map, host-
-    // agnostic, auto-advancing) -> Starting Grid -> Countdown -> Race.
-    // The highlight screen is purely a display: it does not decide when the
-    // race starts. That decision comes from the lobby's 'racing' status,
-    // which every client receives at the same time (see 'raceStarted').
+    // Introductions and the grid are preparation stages; the persistent server
+    // deadline, not delivery time of a database event, decides when GO occurs.
     this.loading("PREPARING MULTIPLAYER RACE…", async () => {
-      // Fetch latest players
-      this.lobbyPlayers = await lobbyManager.fetchPlayers(this.lobby.id);
+      const lobbyId = this.lobby?.id;
+      const players = await lobbyManager.fetchPlayers(lobbyId);
+      await serverClock.sync();
+      if (this.lobby?.id !== lobbyId || !this.multiplayerActive) return;
+      this.lobbyPlayers = players;
 
       // Ensure no AI - multiplayer is human only
       console.log(`[Game] Starting multiplayer race with ${this.lobbyPlayers.length} human players, NO AI`);
@@ -797,7 +805,7 @@ export class Game {
     // Guard against double-invocation: this can be triggered by the synced
     // 'raceStarted' realtime event, by the lobbyUpdated fallback, and by
     // the local 5s highlight-screen safety timeout — only one should win.
-    if (this._startingMultiplayerRace || ["COUNTDOWN", "RACING"].includes(this.state)) return;
+    if (!this.lobby || this._startingMultiplayerRace || ["COUNTDOWN", "RACING"].includes(this.state)) return;
     this._startingMultiplayerRace = true;
 
     this.loading("PREPARING THE GRID…", async () => {
@@ -808,6 +816,14 @@ export class Game {
       this.loadWorld(trackData);
       this.showWorld();
       
+      if (isSupabaseConfigured()) {
+        const lobbyId = this.lobby.id;
+        const { data, error } = await supabase.from('race_members').select('*').eq('race_id', this.lobby.race_id).order('grid_index');
+        if (error) throw error;
+        if (this.lobby?.id !== lobbyId || !this.multiplayerActive) return;
+        if (!data?.length) throw new Error('Race roster unavailable. Apply Supabase migration 005.');
+        this.lobbyPlayers = data.map(p => ({ ...p, profiles: this.lobbyPlayers.find(o => o.player_id === p.player_id)?.profiles }));
+      }
       // Use lobby's mode
       this.store.data.mode = this.lobby.mode;
       
@@ -816,6 +832,8 @@ export class Game {
       const carId = localPlayerData?.selected_car || this.store.data.car;
       const charId = localPlayerData?.selected_character || this.store.data.character;
       
+      this.store.data.car = carId;
+      this.previewCharacter = null;
       this.previewCar = CARS.find(c => c.id === carId) || CARS[0];
       if (charId) {
         this.store.data.character = charId;
@@ -875,6 +893,7 @@ export class Game {
   }
 
   pause() {
+    if (this.multiplayerActive) { this.input.clear(); return; }
     if (this.state === "PAUSED") {
       this.resume();
       return;
@@ -963,7 +982,8 @@ export class Game {
         console.log("[Game] Fall detected, recovering");
         if (this.multiplayerRace) {
           // In multiplayer, use kart respawn logic if available
-          this.kart?.respawn?.(this.kart.racers[0]);
+          if (this.kart) this.kart.respawn(this.kart.racers[0]);
+          else collisionSystem.recoverToCheckpoint(p, this.progress, this.track);
         } else {
           collisionSystem.recoverToCheckpoint(p, this.progress, this.track);
         }
@@ -990,7 +1010,7 @@ export class Game {
         this.lastGear = gear;
       }
       
-      this.raceTime += dt;
+      this.raceTime = this.multiplayerRace.raceTime;
       const newLap = this.progress.update(out.nearest.s, out.headingDot);
       if (before !== this.progress.checkpoint && !newLap)
         this.audio.tone(780, 0.06, 0.035, "sine");
@@ -1359,14 +1379,14 @@ export class Game {
     requestAnimationFrame(this.loop);
     
     // Performance: measure frame time
-    const frameStart = performance.now();
-    let dt = Math.min(0.05, Math.max(0, (now - this.last) / 1000));
+    const frameDuration = Math.max(0, now - this.last);
+    let dt = Math.min(0.05, frameDuration / 1000);
     this.last = now;
     
     // FPS calculation
     if (this.debug.enabled) {
-      this.debug.frameTime = performance.now() - frameStart;
-      this.debug.fps = Math.round(1 / dt);
+      this.debug.frameTime = frameDuration;
+      this.debug.fps = Math.round(1000 / Math.max(1, frameDuration));
     }
     
     const frozen =
@@ -1375,8 +1395,10 @@ export class Game {
     if (!frozen) this.time += dt;
     
     if (this.state === "COUNTDOWN") {
-      this.countdown -= dt;
-      const num = Math.max(1, Math.ceil(this.countdown - 0.4));
+      if (this.multiplayerActive && this.lobby?.race_start_at)
+        this.countdown = Math.max(0, (Date.parse(this.lobby.race_start_at) - serverClock.now()) / 1000) + 0.4;
+      else this.countdown -= dt;
+      const num = Math.max(1, Math.min(3, Math.ceil(this.countdown - 0.4)));
       if (num !== this.lastBeep) {
         this.lastBeep = num;
         this.audio.tone(440, 0.12, 0.11);
@@ -1414,16 +1436,15 @@ export class Game {
         const pct = Math.min(100, ((this.time - this.introStartTime) / this.introDuration) * 100);
         el.style.width = pct + "%";
       }
-      // Safety net only: the real trigger is the synced 'raceStarted'
-      // event (see lobbyManager.on('raceStarted', ...)). This just makes
-      // sure a client can never get stuck here forever if that event is
-      // somehow missed - it fires slightly after the server-side status
-      // flip so the event has every chance to win the race first.
-      if (this.time - this.introStartTime > this.introDuration + 1) {
+      // Prepare the grid four seconds before the shared deadline. Late loaders
+      // catch up immediately rather than starting another independent countdown.
+      if (serverClock.now() >= Date.parse(this.lobby.race_start_at) - 4000) {
         this.startMultiplayerRace();
       }
     }
     
+    // Rendering and transport continue in countdown/results, independently of physics ticks.
+    this.multiplayerRace?.networkFrame(dt);
     if (!frozen) {
       this.environment?.update(this.time);
       this.updateCamera(dt);
@@ -1444,6 +1465,10 @@ export class Game {
       this.renderer.info.reset();
     }
     
+    if (this.state === 'MULTIPLAYER_LOBBY') {
+      this.carPreview ??= new CarPreview(this.renderer);
+      this.carPreview.render(this, now);
+    } else if (this.carPreview) { this.carPreview.dispose(); this.carPreview = null; }
     this.renderer.render(this.scene, this.camera);
     
     // Performance: clear collision cache periodically
