@@ -1,307 +1,148 @@
-# Multiplayer Architecture - Pixel Racer 3D
+# Multiplayer: synchronization audit and current implementation
 
-## Overview
+## Deployment gate
 
-Multiplayer is **real-player only** - NEVER AI. The system uses Supabase for persistent state and Realtime Broadcast for ephemeral position sync.
+**Apply `supabase/migrations/005_race_network.sql` before deploying this client to an existing project.** New installations may run `supabase/schema.sql` and enable the table publications described in `supabase/README.md`. No movement table or per-frame SQL write is introduced.
 
-## Flow
+The changes have automated coverage, but **live Supabase websocket authorization, WAN reconnection, and competitive eight-device performance still require deployment testing**. This checkout has no configured Supabase project. Do not treat the offline tests as certification of online playability.
 
-```
-OPEN GAME
-  ↓
-USERNAME CHECK (3-16 chars, letters/numbers/spaces)
-  ↓
-MAIN MENU
-  Single Player | Multiplayer | Settings
-  ↓
-MULTIPLAYER MENU
-  Create Lobby | Join Lobby
-  ↓
-CREATE LOBBY
-  Generates 6-digit code (e.g., 482193)
-  Host auto-joins as P1
-  ↓
-LOBBY (waiting)
-  Code: 482193
-  Players: 1/8, 2/8, ... 8/8 max
-  Mode: classic/kart
-  Map: selected track
-  Each player: car, character (kart), ready state
-  Realtime updates for join/leave/selection/ready
-  ↓
-ALL READY (min 2, max 8, all ready, valid selections)
-  Host can start
-  ↓
-PLAYER HIGHLIGHTS
-  Cinematic intro for each HUMAN player only
-  Shows username, character, car
-  No AI
-  ↓
-MAP HIGHLIGHT
-  Track name, preview, laps, length, shortcuts, hazards
-  ↓
-STARTING GRID
-  Only real players, P1, P2, P3...
-  No AI fallback
-  ↓
-COUNTDOWN
-  3, 2, 1, GO!
-  ↓
-MULTIPLAYER RACE
-  Local player: immediate responsive controls, physics, no server wait
-  Remote players: interpolation, state buffering, smoothing
-  Name tags above cars (canvas sprites, face camera, distance culling)
-  Power-ups: synchronized collection (host authority for box ownership)
-  Collision: robust vehicle separation, track boundaries, no-clipping fixes
-  Fall detection: recover to checkpoint
-  Stuck detection: recover after 4s
-  ↓
-RESULTS
-  Only real players
-  Positions from rankRacers (progress-based, finish time tie-break)
-  Saved to race_results if Supabase configured
-  ↓
-RETURN TO LOBBY / MENU
-```
+## Audit of the previous implementation
 
-## Supabase Integration
+The audit followed this exact path:
 
-### Tables
+`Input.controls → Game.step → CarPhysics.update → MultiplayerRace.after → broadcastLocalState → LobbyManager race channel → player_state callback → RemotePlayer.addState → RemotePlayer.update → Car.group → renderer.render`
 
-- **profiles**: id (uuid, FK auth.users), username (unique case-insensitive, 3-16 chars, safe)
-- **lobbies**: id, code (6-digit numeric, unique among active), host_id, mode, map_id, status (waiting, starting, racing, finished, closed), max_players (8), timestamps
-- **lobby_players**: id, lobby_id, player_id, selected_car, selected_character, is_ready, joined_at, last_seen_at, unique(lobby_id, player_id)
-- **race_sessions**: id, lobby_id, started_at, finished_at, mode, map_id, status
-- **race_results**: id, race_id, player_id, finishing_position (1-8), finish_time, unique(race_id, player_id), unique(race_id, finishing_position) - NO AI rows
+| Question | What the source actually did / defect found |
+|---|---|
+| Initialization/authentication | `supabase/client.js` creates one browser client. `auth.js` restores or anonymously authenticates a Supabase user. A real authentication failure previously fabricated a mock user ID while still using real SQL; that fallback is now prohibited when configured. |
+| Lobby persistence | `lobbies`, `lobby_players`, and `profiles`; membership keyed by authenticated user ID, with PostgreSQL change subscriptions. The invoker host-migration trigger attempted to change `host_id` under an RLS policy requiring the new ID to still be the departing user. SQL 005 fixes this with a fixed-scope definer trigger. |
+| Send location/rate | `MultiplayerRace.after()` called a 50 ms gate: at most 20 Hz, dependent on physics stepping. No movement SQL writes were present. Rendering was not awaiting a network request. |
+| Storage/transport | Transient Broadcast payload on a lobby-owned race channel, not PostgreSQL. The old `eventsPerSecond: 20` client option did not implement application-level backpressure; it has been removed, not increased. |
+| Reception | Callback selected the remote map entry using a payload-supplied `player_id`, without membership/finite-value/sequence validation or authenticated sender binding. |
+| Timestamps/order | Sender used `performance.now()`, but `addState()` replaced it with receiver arrival time. No sequence number or stale-packet rejection existed. |
+| Buffer/interpolation | A ten-entry array was filled but **never sampled**. Rendering lerped to the newest target by `0.15` **per frame**, so visual delay grew as frame rate fell. |
+| Frozen mesh bug | After one second without a packet, prediction changed `remote.position` but skipped the only `car.group.position.copy(...)` call. Thus the predicted vehicle never reached the renderer. Prediction then stopped after half a second. |
+| Rotation/velocity | Only yaw was sent. Yaw chasing was frame-dependent; velocity was not used between ordinary packets. |
+| Subscription lifetime | First-race callbacks were registered before subscribing, but race disposal only nulled its channel reference. The lobby retained the channel and old closures. Subsequent races attached additional handlers to it. Lobby subscription setup also lacked teardown/generation protection. |
+| Progress/results | Remote `RaceProgress` was initialized at the grid and **never updated**. Only the host created/received a race session ID, so guests could not persist their results. Client-chosen finishing positions could conflict with the database unique position constraint. |
+| Grid/start | A host-side 4.2-second timeout changed lobby status. Each receiver loaded assets and independently ran another 3.8-second countdown, making load time and event arrival time part of the starting advantage. |
+| Selected physics | `getCarSpecForPlayer()` ignored `CARS` and `combineStats`, returning placeholder 75-valued physics. The chosen visible car and actual multiplayer physics did not match. |
+| Kart interactions | The Kart race wrapper contained the local human only (the AI list was empty). Remote item handlers existed but local item activation did not send them. |
+| Collision/recovery | Remote velocity and position were cosmetically modified after receiving state; a second track-boundary resolver competed with `CarPhysics`. Classic multiplayer fall recovery attempted an optional Kart-only method and did nothing. |
+| Assets/camera/loop | The existing renderer, world reuse, physics substeps, input simulation, and exponential chase-camera damping were usable and retained. No justification was found for rebuilding these systems. |
 
-### Functions
+These are source-level, reproducible defects, not a claim that every possible production freeze had one cause. Packet delivery on the user's actual Supabase project cannot be traced without a deployed connection.
 
-- `generate_lobby_code()`: Random 6-digit, checks active lobbies, retries up to 100
-- `can_start_race(lobby_uuid, requester_id)`: Validates host, waiting status, 2-8 players, all ready, valid cars/characters
-- `handle_host_migration()`: Trigger on lobby_players DELETE, if host leaves, earliest joined becomes new host, else close lobby
-- `cleanup_old_lobbies()`: Close waiting >24h, delete closed >7d
-- `update_updated_at()`: Trigger for updated_at
+## Current boundaries
 
-### RLS
+### Persistent state
 
-Enabled on all tables. Policies:
-- Profiles viewable by all, users can only insert/update own
-- Lobbies viewable by all, auth can create, only host can update/delete
-- Lobby_players viewable by all, auth can join waiting lobbies with <8 players, users can update/delete own, host can delete any
-- Race_sessions viewable by lobby members, only host can create/update
-- Race_results viewable by all, players can insert own, host can insert for lobby
+- Existing profile, username, lobby, selection, ready, map and mode records.
+- `start_race(lobby_uuid)` validates `auth.uid()` as host and readiness, locks the lobby, creates one race session and an immutable `race_members` grid, and writes a shared server deadline ten seconds ahead.
+- Membership mutation triggers serialize joins/selections against that start lock, prevent identity changes, and enforce capacity.
+- `mark_race_started(rid)` allows a roster member to acknowledge GO only once the **server** deadline has elapsed. The host's browser need not remain connected.
+- `submit_race_finish(rid, seconds)` is authenticated, idempotent, clock-bounded, and race-member-only. It serializes result ranking by finish time and finishes the persistent session once all roster members have submitted. Raw client result writes are revoked.
+- Lobby recovery reads occur every five seconds; result recovery/retries every three seconds. Neither contains vehicle movement.
 
-### Realtime
+### Transient transport
 
-- **Postgres Changes**: lobbies, lobby_players, race_sessions, race_results, profiles for lobby membership, ready, selections, host, status
-- **Broadcast**: Ephemeral position sync (20Hz), power-up events, finish events - NOT stored in DB
-- **Presence**: Online status, disconnect handling
+`RaceTransport.js` owns channel lifetime, status, Presence, and sends. `NetworkState.js` is engine-independent validation/interpolation logic. `MultiplayerRace.js` maps authenticated IDs to actual vehicles and progress.
 
-### Security
+**Topic layout: `race:<raceId>:<authenticatedPlayerId>`**
 
-- No service-role key in browser, only anon key via VITE_SUPABASE_ANON_KEY
-- Username validation: trim, normalize spaces, 3-16, letters/numbers/spaces, no HTML/JS/SQL
-- Lobby code validation: exactly 6 digits, numeric only
-- Host validation server-side via RLS and can_start_race()
-- No client can claim host, finish position, etc without validation
+Each client subscribes to exactly the same bounded set of race-member topics (2–8); it only publishes/tracks Presence on its own topic. These use the existing Supabase Realtime websocket, not one socket per player. A two-player game therefore has two race topics per client, plus the two low-frequency lobby subscriptions; eight players have eight plus two. These are intentional channels, not duplicates.
 
-## Networking
+Why not one public/shared topic? Supabase's topic authorization does not authenticate arbitrary `playerId` fields inside each Broadcast payload. SQL policies allow reads only to the frozen race roster and writes only to the topic owner's `auth.uid()`. The receive callback binds the topic owner before packet validation. A player sending another player's ID on their own topic is rejected, and cannot publish on the victim's private topic. **Do not add broad permissive `realtime.messages` policies**, which would OR with these policies and defeat this boundary.
 
-### DO NOT use PostgreSQL for 60 FPS position
+### State pipeline
 
-- Persistent state (lobby, ready, selections, results) in DB
-- Ephemeral state (position, rotation, velocity) via Broadcast
+1. The existing local `CarPhysics` simulates immediately from input, with normal substeps. It never awaits transport or DB acknowledgement.
+2. Once per render frame, a separate networking pass samples fresh state, including while the grid/results are visible.
+3. A configurable `NETWORK.rate` cap defaults to 20 Hz. Stationary states suppress unneeded sends but heartbeat every 500 ms. There is at most one in-flight send; packets are not queued for later catch-up. A saturated websocket buffer or disconnected channel drops the send attempt instead of triggering the SDK's unsubscribed HTTP fallback.
+4. Packets identify type, race, authenticated player, sequence, and sender-monotonic timestamp; position, three rotation components, velocity, steering, throttle/brake/drift/boost flags, lap/checkpoint/progress, finish time and small Kart state travel together.
+5. The receiver rejects nonfinite/out-of-range data, wrong sender/race, duplicate/older sequences, and backward timestamps.
+6. Each remote stores at most 32 snapshots. A minimum-transit clock-offset estimate maps the sender's monotonic timeline to the receiver without comparing browser wall clocks.
+7. The view samples 100 ms behind that timeline, interpolates position and wrapped angles, and quaternion-slerps mesh orientation. If a packet is missing it predicts from velocity for **at most 150 ms**, then stops predicting. Small corrections use time-based damping; errors over 35 world units reset in a controlled snap.
+8. The sampled state **always updates the car mesh**, including prediction/stale branches. Wheels, steering and brake lights update at render rate. Progress/ranking use received race progress rather than inference from the delayed mesh.
 
-### Broadcast Message Format
+The engine's chassis physics only rotates around yaw; packet pitch/roll are currently zero, matching the actual local group. The existing body lean animation uses synchronized steering/speed and is now frame-rate independent. No fake pitch/roll physics was added.
 
-```json
-{
-  "player_id": "uuid",
-  "x": 123.4,
-  "y": 0.5,
-  "z": -456.7,
-  "yaw": 1.2,
-  "speed": 25.3,
-  "vx": 10,
-  "vy": 0,
-  "vz": 20,
-  "timestamp": 123456789
-}
+### Connection/lifecycle
+
+- All handlers are bound before subscription. Start/dispose are idempotent; subscription generations prevent late lobby fetches/listeners from changing a replacement lobby.
+- Per-topic connection errors schedule a single jittered retry. A successful SDK rejoin cancels it. Disconnected sends are dropped. Fresh full-state heartbeats restore remote state without replaying an old movement queue.
+- Presence marks availability; it does not transport movement. Temporary outages retain the car/interpolation buffer. With the local connection healthy, 30 seconds without a remote update retires that racer to DNF and releases the scene objects, tags, item references, and channel. Explicit lobby departure removes them immediately, retaining only their results entry.
+- Long outages that exceed that retirement grace require a new race; full page-reload race resumption is not implemented.
+- Tags, textures, sprite materials, cars, interpolation buffers, handlers, timers and channels are released on leaving/restarting. The lobby's persistent subscription lifetime is separate from the race's transport lifetime.
+- Multiplayer does not locally pause the race on blur/ESC; it clears input instead. Single-player pause is unchanged.
+
+### Kart and collision behavior
+
+- Kart item rosters now include only the real local/remote humans. Remote entries never run AI activation, collect boxes locally, or have their physics modified by another client's item simulation.
+- Pickup/activation events have sequence IDs and a bounded retransmission journal. Peers acknowledge processed events in snapshots; duplicates are ignored. The journal expires after five seconds so an ancient attack is not replayed after a long outage. Durable start/finish are **not** dependent on this journal.
+- Remote activation uses the existing item simulation for visuals/projectiles, with authenticated target IDs mapped to local item indices. Only the victim's client applies hit physics. Current shield/boost/turbo/magnet timers also travel in snapshots to recover their visual state.
+- **Limit:** simultaneous item-box claims are still client-authoritative, not centrally arbitrated. This is not server-authoritative anti-cheat, nor guaranteed attack delivery after a multi-second outage. A host/server arbiter would be needed for strict tournament-grade item ownership and hit validation.
+- Local-versus-remote impacts use bounded position correction/impulse and a cooldown; stale cars cannot create ghost impacts. There are no remote-versus-remote cosmetic pushes or duplicate track-boundary resolution. Existing acceleration/braking/drift balance is unchanged.
+
+## Selection UI
+
+`SelectionStats.js` reads `CARS`, `CHARACTERS`, and the existing `combineStats` function. The UI shows actual 0–100 configuration ratings, not fictitious physical units; it only shows fields present in the selected data. Cars have speed, acceleration, handling, braking and drift; character weight appears where supported. Kart panels explicitly distinguish car, character and combined racing stats. Differences are against the previously selected car and do not imply that heavier always means better.
+
+`CarPreview.js` reuses the game's WebGL renderer. It keeps one preview scene/camera/light rig, disposes only the old vehicle on selection changes, and copies a small preview into a 2D UI canvas at up to 30 Hz. It does not add a WebGL renderer or animation loop. Names, descriptions and ratings update immediately; the low-frequency lobby selection still persists through the existing database flow and clears readiness.
+
+## Diagnostics
+
+The subtle race status badge is always available. For development builds only:
+
+```dotenv
+VITE_NETWORK_DEBUG=true
+VITE_NETWORK_LOG=true
 ```
 
-- Sent at 20Hz (50ms interval)
-- Only when race active
-- Self: false (don't receive own)
+The overlay reports connection status, **server RPC RTT** (not an invented websocket ping), actual send/receive rates, active topics, player count, invalid/send-failure counts, and each peer's age, sequence, interpolation mode, rejected packets and XYZ. Optional logs report connection transitions; production does not create this panel or enable verbose logging.
 
-### Interpolation
+## Verification performed in this checkout
 
-- RemotePlayer class buffers last 10 states
-- Lerp position towards target with smoothing 0.15
-- Yaw wrapping with atan2(sin, cos)
-- Extrapolation for up to 0.5s if no update, then freeze
-- Name tags: THREE.Sprite with canvas texture, distance culling >80, scale with distance
+```sh
+npm test                       # 30 passing unit / simulation / Postgres tests
+npm run build                  # passes; existing chunk-size/dynamic-import warnings remain
+npm run dev                    # keep running while using browser suites below
+npm run test:browser            # Classic regression, passes
+npm run test:kart-browser       # Kart regression, passes
+npm run test:multiplayer-browser # two browser pages, two races, passes
+npm run test:multiplayer-load    # synthetic 2–8-racer renderer/receive benchmark
+```
 
-### Power-up Sync
+- Unit suites cover the existing car/map/AI/physics/item features; all 48 character/adventure combinations and 30 Classic car/track combinations still complete their laps.
+- Network simulations cover 2–8 racers at 10, 75 and 200 ms nominal latency, jitter, 3–8% packet loss, reordering, and a two-second outage. They assert recovery, bounded buffers, finite states and no stale rollback on a straight.
+- Transport tests use an injected client to check authenticated-topic identity binding, bind-before-subscribe, idempotency, in-flight/websocket backpressure, cancellation, retry and cleanup. They do not replace a live websocket test.
+- PGlite runs real Postgres functions/triggers/RLS with minimal Auth/Realtime schema fixtures. Tests verify non-host start rejection, frozen roster, outsider/topic spoof rejection, start deadline, duplicate finish idempotency and ranked persistent results. Optional extension installers are skipped in this WASM fixture.
+- The two-page browser suite exercises selections, real preview pixels, readiness, shared-deadline countdown, zero AI, correct selected physics, moving remote meshes, progress, packet-drop recovery, human-only results, cleanup, a second Kart race, replicated shield use, and explicit removal. No console errors were observed.
+- Existing browser fixtures were updated to seed a valid username so they can reach the menu rather than time out at the already-existing first-run username prompt.
 
-- Collection: When player collects box, broadcast powerup_collected {player_id, box_index, item}
-- Host authority: box cooldown set to 5s to prevent double collection
-- Activation: Broadcast powerup_used {player_id, item, target}
-- Effects: Visual particles, shield, boost, etc handled locally but notified
+### Synthetic load measurement — not a WAN/hardware pass
 
-## Collision Improvements
+Headless Chromium, **software SwiftShader**, 800×600, low graphics, one renderer with synthetic BroadcastChannel peers:
 
-### Previous Bugs Fixed
+| Total racers | Remote cars | Receive/s | FPS | p95 frame ms | Geometries |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 1 | 19.8 | 6.5 | 383.4 | 101 |
+| 3 | 2 | 39.4 | 3.6 | 516.6 | 128 |
+| 4 | 3 | 59.3 | 4.0 | 600.0 | 155 |
+| 5 | 4 | 79.5 | 2.8 | 533.3 | 182 |
+| 6 | 5 | 98.5 | 2.6 | 833.2 | 209 |
+| 7 | 6 | 119.2 | 3.0 | 533.3 | 236 |
+| 8 | 7 | 139.3 | 3.9 | 533.4 | 263 |
 
-- Tunneling through walls at high speed: Added continuous collision detection (CCD) with substeps, checking intermediate positions
-- Vehicle overlap: Robust separation with mass ratio, penetration correction + buffer, velocity impulse with restitution, damping
-- Track boundary clipping: More robust correction (0.15 buffer, 0.75 damping), clamp lane to -5..5
-- Ramp falling through: Added ramp height detection near ramps (0.3, 0.77), ground = max(track ground, ramp height)
-- Falling through map: Improved fall detection (y < ground-16, distance >65, openEdge, !isFinite), recover to checkpoint
-- Stuck in geometry: Stuck detection (speed <1.5 while trying to move for 3s, invalid geometry distance >25 for 2s), recover after 4s
-- AI stuck: Added stuckTime tracking, lane reversal, forward teleport if >5s
+All configurations had zero AI/invalid packets, exactly N−1 remote models, and three buffered snapshots per peer at measurement. Browser coarse heap telemetry reported about 28 MB; this is not a memory leak proof. The software-rendered frame rates are **not competitively playable**, even at two racers, so they cannot support an eight-player FPS acceptance claim. GPU-device frame times, CPU/GPU usage, precise memory profiling, websocket ping and Supabase quota behavior must be measured separately. Raw generated reports stay in ignored `.cache/browser-tests/`.
 
-### New Collision System (src/physics/Collision.js)
+## Required live acceptance pass
 
-- Broad-phase: distance check <15, cached 100ms
-- Narrow-phase: precise penetration, normal
-- Vehicle collision: min separation 2.2, mass-based correction, impulse, damping, max velocity clamp
-- Track boundary: soft (offroad) vs hard (collision), openEdge handling for Sky Island
-- CCD: Check intermediate positions when moveDist >2, steps = ceil(dist/2)
-- Stuck: lowSpeedTime, invalidGeometryTime, shouldRecover
-- Fall: isBelow, isFar, isOffOpenEdge
-- Recovery: to checkpoint (checkpoint-1)/12+0.003, reset velocity, 2s lock, 3s immunity
+1. Apply SQL 005, verify Anonymous auth and Realtime private-channel authorization, and audit existing permissive `realtime.messages` policies.
+2. Use distinct authenticated accounts on 2, 3, 4, 5, 6, 7 and 8 GPU-equipped clients. Run both modes/maps, finish in differing orders, verify durable ranks, and repeat races without growing topic/model counts.
+3. Confirm each client has exactly N race topics + two lobby channels; rate stays at or below 20 outgoing movement messages/s and idle heartbeat near 2/s. At eight active racers, plan for roughly 160 publishes/s and 1,120 peer deliveries/s before other traffic. Check project quotas rather than raising the update rate to mask throttling.
+4. Try a nonmember/private-topic join, another player's write topic, a forged payload ID, NaN/Infinity, old sequence, old race ID, duplicate finish, and a non-host start. Verify denial without corrupting rendering.
+5. Add 50–100 ms and 150–250 ms latency/jitter/loss, interrupt the websocket for a few seconds, resume it, and background/restore a tab. Confirm current-state recovery without a queue burst or a new local countdown.
+6. Profile 60/120 Hz rendering, CPU/GPU frame cost and memory on the supported target devices. Check collision feel, ramps, recovery, boosts and item-hit fairness under latency.
 
-## Performance Optimizations
-
-### Game Loop
-
-- Reuse vectors: _cameraTarget, _lookTarget, _forward, _right, _tempVec to avoid creation
-- Cache DOM elements: _cachedElements Map, getElement(id)
-- HUD: Only update DOM when value changed (cache lap, position, timer, etc), minimap every other frame
-- Collision: Broad-phase cache, clear every 5s
-- Particles: Fixed pool (420), reuse, not create/destroy every frame
-- Rendering: renderer.info.autoReset = false, only reset if debug enabled
-- Shadow: Lower resolution for low/medium (512/1024 vs 2048)
-- AI: Personality-based, not every frame heavy
-
-### Three.js
-
-- Shared geometries and materials where possible (Car.js merged bodywork, instanced meshes for rails, curbs, dashes)
-- Frustum culling (default, but ensure not disabled unnecessarily)
-- InstancedMesh for repeated objects (rails, posts, curbs, dashes)
-- Texture reuse (asphalt DataTexture)
-- Object pooling for particles and skid marks
-
-### HUD
-
-- setIfChanged pattern for lap, position, timer, bestLap, speed, gear, drift, checkpoint
-- Nitro and RPM always update (frequent)
-- Minimap redraw throttled
-
-### Network
-
-- Broadcast 20Hz, not 60Hz DB writes
-- Only send necessary data (pos, yaw, speed, vel, timestamp)
-- Interpolation smooths remote movement
-- Local movement immediate, no server wait
-
-## Username System
-
-- First use: Check localStorage pixel-racer-username and pixel-racer-save.name
-- If invalid/missing, show USERNAME_PROMPT state
-- Validation: trim, 3-16, letters/numbers/spaces, no HTML/JS/SQL, normalize spaces
-- Unique check: Case-insensitive via lower(username), allow own
-- Save to: localStorage pixel-racer-username, pixel-racer-save.name, Supabase profiles
-- Display: Above car (name tags), lobby, intros, grid, race, leaderboard, results
-- Change: Via settings or multiplayer menu
-
-## Host System
-
-- Creator becomes host
-- Only host can: start race, change map/mode, close lobby, kick (if implemented)
-- Frontend hides/disables host controls for non-host
-- Backend: RLS policies check auth.uid() = host_id, can_start_race() validates host
-- Host disconnect: Trigger handle_host_migration, earliest joined becomes new host, deterministic (joined_at asc)
-
-## Testing Checklist
-
-### Username
-- [ ] New user prompt
-- [ ] Invalid (too short, too long, bad chars, HTML, SQL)
-- [ ] Duplicate
-- [ ] Persistence after refresh
-- [ ] Change via settings
-
-### Lobby
-- [ ] Create generates unique 6-digit code
-- [ ] Join with valid code
-- [ ] Invalid code (letters, symbols, wrong length)
-- [ ] Full lobby (8/8)
-- [ ] Closed/racing lobby
-- [ ] Multiple joins realtime
-- [ ] Leave
-- [ ] Host leave -> migration
-- [ ] Host migration deterministic (earliest)
-
-### Selection
-- [ ] Classic: car selection
-- [ ] Kart: character + car
-- [ ] Ready state
-- [ ] Ready requires valid selections
-
-### Host
-- [ ] Host can start (all ready, 2-8 players, valid)
-- [ ] Non-host cannot start
-- [ ] Host can change map/mode
-- [ ] Non-host cannot change protected settings
-- [ ] Server-side validation for start
-
-### Multiplayer Race
-- [ ] 2,3,4,5,6,7,8 players - NO AI in any case
-- [ ] Starting grid = human count
-- [ ] Player intros = human count
-- [ ] Countdown
-- [ ] Movement responsive
-- [ ] Remote interpolation smooth, no teleport
-- [ ] Collision no-clipping fixed
-- [ ] Name tags
-- [ ] Power-ups sync
-- [ ] Lap counting
-- [ ] Finish
-- [ ] Results only real players
-
-### Disconnect
-- [ ] Player disconnect in lobby
-- [ ] Host disconnect in lobby -> migration
-- [ ] Player disconnect during race -> frozen
-- [ ] Reconnect (if supported)
-- [ ] Tab close, refresh
-
-### Performance
-- [ ] Long session stable FPS
-- [ ] Multiple players smooth
-- [ ] Heavy map (forest, city)
-- [ ] Many effects
-- [ ] Many collisions
-- [ ] Network activity low
-
-## Known Limitations
-
-- No dedicated server - P2P via Broadcast, host is not authoritative for physics (could be cheated)
-- No anti-cheat beyond basic validation
-- Power-up sync is optimistic, host not fully authoritative
-- No voice chat
-- No spectator mode
-- Reconnect during race limited (position sync resumes, but lap progress may be off)
-- Offline mock mode only works same browser (localStorage), not real multiplayer without Supabase
-
-## Future Improvements
-
-- Authoritative server for physics and power-ups
-- Lag compensation
-- Better host migration during race
-- Spectator
-- Chat
-- Matchmaking
-- Leaderboards global
-- Replay
+Until this pass is run, live Realtime behavior and eight-human competitive playability remain unverified, and the item-ownership limitation above remains explicit.

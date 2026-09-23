@@ -7,6 +7,9 @@ export class KartRace {
     this.group = new THREE.Group();
     this.racers = [
       racerState(0, game.player, game.car, game.progress, game.player.spec),
+      ...Array.from(game.multiplayerRace?.remotePlayers.values() || []).map((r, i) => ({
+        ...racerState(i + 1, r, r.car, r.progress, r.spec), remote: true, networkId: r.id,
+      })),
       ...game.ai.map((a, i) =>
         racerState(i + 1, a, a.car, a.progress, a.car.spec),
       ),
@@ -16,9 +19,10 @@ export class KartRace {
       itemSeed = (Math.imul(itemSeed, 1664525) + 1013904223) >>> 0;
       return itemSeed / 4294967296;
     };
-    this.items = new ItemSystem(game.track, this.racers, (event, r) =>
-      this.feedback(event, r),
+    this.items = new ItemSystem(game.track, this.racers, (event, r, detail) =>
+      this.feedback(event, r, detail),
     );
+    this.items.localPlayerId = game.multiplayerRace?.localPlayerId;
     this.time = 0;
     this.message = "ITEM BOXES AHEAD";
     this.messageUntil = 4;
@@ -45,8 +49,13 @@ export class KartRace {
     this.makeView();
     game.scene.add(this.group);
   }
-  feedback(event, r) {
+  feedback(event, r, detail) {
     if (r.id !== 0) return;
+    if (this.g.multiplayerRace) {
+      if (event === 'pickup') this.g.multiplayerRace.queueEvent({ type: 'pickup', box: detail, item: r.item });
+      if (['boost','turbo','shield','magnet','oil','wave','emp','bolt'].includes(event) && this.activating)
+        this.g.multiplayerRace.queueEvent({ type: 'use', item: event, target: r.lastTarget });
+    }
     const texts = {
       pickup: "ITEM ACQUIRED!",
       token: "+1 RACE TOKEN",
@@ -274,12 +283,40 @@ export class KartRace {
       }
   }
   activate() {
-    return this.g.state === "RACING" && this.items.activate(this.racers[0]);
+    this.activating = true;
+    const activated = this.g.state === 'RACING' && this.items.activate(this.racers[0]);
+    this.activating = false;
+    return activated;
   }
+  remoteActivate(playerId, item, targetId) {
+    if (!['boost','turbo','shield','magnet','oil','wave','emp','bolt'].includes(item)) return;
+    const r = this.racers.find(r => r.networkId === playerId);
+    if (!r) return;
+    r.item = item; r.roulette = 0; r.cooldown = 0;
+    const target = targetId === this.g.multiplayerRace.localPlayerId ? this.racers[0] : this.racers.find(r => r.networkId === targetId);
+    this.items.activate(r, target?.id);
+  }
+  removeRemote(playerId) {
+    const index = this.racers.findIndex(r => r.networkId === playerId);
+    if (index < 1) return;
+    // Item indices are local implementation details, never wire identities.
+    // Remap finite projectile pools before releasing the departed car reference.
+    for (const p of this.items.projectiles) {
+      if (p.owner === index || p.target === index) p.life = 0;
+      if (p.owner > index) p.owner--;
+      if (p.target > index) p.target--;
+    }
+    this.racers.splice(index, 1);
+    this.racers.forEach((r, i) => { r.id = i; });
+    const shield = this.shields.splice(index, 1)[0];
+    if (shield) { shield.removeFromParent(); shield.geometry.dispose(); shield.material.dispose(); }
+  }
+
   before(dt) {
     this.time += dt;
     this.items.before(dt);
     for (const r of this.racers) {
+      if (r.remote) continue;
       const physics = r.physics;
       if (this.surfaces.some((s) => r.position.distanceTo(s.position) < 15)) {
         physics.kartEffects.grip *=
@@ -332,7 +369,7 @@ export class KartRace {
   after(dt) {
     const track = this.g.track;
     for (const r of this.racers) {
-      if (r.progress.finished) continue;
+      if (r.remote || r.progress.finished) continue;
       for (const pad of this.pads)
         if (
           r.position.distanceTo(pad.position) < 5 &&

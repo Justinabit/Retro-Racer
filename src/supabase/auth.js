@@ -21,8 +21,7 @@ export async function initAuth() {
         
         if (error) {
           console.error("[Auth] Anonymous sign-in failed:", error);
-          // Fallback to mock user if anonymous auth not enabled
-          currentUser = createMockUser();
+          throw error;
         } else {
           currentUser = data.user;
           console.log("[Auth] Anonymous sign-in success:", currentUser.id);
@@ -49,6 +48,7 @@ export async function initAuth() {
       console.log("[Auth] Mock user:", currentUser.id);
     }
   } catch (e) {
+    if (isSupabaseConfigured()) throw e;
     console.warn("[Auth] Init failed, using mock:", e);
     currentUser = createMockUser();
   }

@@ -269,7 +269,7 @@ export class Car {
     this.body.rotation.z = THREE.MathUtils.lerp(
       this.body.rotation.z,
       -steer * Math.min(Math.abs(speed) / 65, 1) * 0.055,
-      0.15,
+      1 - Math.exp(-9.75 * dt),
     );
   }
   dispose() {
